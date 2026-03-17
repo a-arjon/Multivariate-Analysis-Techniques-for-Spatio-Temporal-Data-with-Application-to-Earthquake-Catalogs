@@ -1,0 +1,521 @@
+---
+title: "ST Multivariate Analysis"
+author: "Alejandra Arjon"
+date: "`r Sys.Date()`"
+output: html_document
+---
+## Loading data and formating date
+```{r}
+library(sf)
+library(dplyr)
+library(lubridate)
+
+catalog <- read.table("../data/SearchResults.txt", header = T)
+
+# Prepare and format time
+# UTC format
+catalog <- catalog %>%
+  mutate(
+    # Combine columns into a single string "YYYY/MM/DD HH:MM:SS.ss"
+    full_time_str = paste(YYY.MM.DD, HH, mm, SS.ss, sep = " "),
+    # Convert string to a date-time object
+    date_time = as.POSIXct(full_time_str, format="%Y/%m/%d %H %M %OS", tz="UTC"))
+```
+
+## Creating grid
+```{r}
+#-121 to -114 and latitude 32 to 37
+# Some points are at LAT 32, so region has to be expanded a bit
+# Adding spatial bins to events 
+# Convert catalog into sf object
+# coordinate reference system (CRS) = 4326 (WGS84), 0.1x0.1 degrees is roughly 11km x 11km at the equator, but the width shrinks as you move toward the poles
+catalog <- st_as_sf(catalog, coords = c("LON", "LAT"),crs = 4326)
+#Get the region and expand it by a small margin of 0.1 degrees
+bbox <- st_bbox(c(xmin = -121.1, xmax = -113.9, ymin = 31.9, ymax = 37.1), crs = 4326)
+# Define pixel size to 0.1 x 0.1  degrees
+grid <- st_make_grid(bbox, cellsize = c(0.1, 0.1), square = TRUE) %>%
+  st_sf() %>%
+  mutate(grid_id = row_number())
+
+# create a new catalog with spatial bins
+events_binned <- st_join(catalog, grid)
+events_binned <- events_binned[,-c(1:4, 14)]
+events_binned <- st_as_sf(events_binned, coords = c("LON", "LAT"),crs = 4326)
+head(events_binned)
+summary(events_binned)
+#earthquake threshold
+threshold <- 4.5
+```
+
+### Plot of grid with events
+
+```{r}
+library(ggplot2)
+#Load the California state boundary
+ca_state <- subset(map_data("state"), region == "california")
+ca_counties <- subset(map_data("county"), region == "california")
+
+ggplot() +
+  geom_polygon(data = ca_counties, aes(x = long, y = lat, group = group), 
+               fill = "lightgray", color = "white", linewidth = 0.1) + 
+  
+  # Background: State Outline
+  geom_polygon(data = ca_state, aes(x = long, y = lat, group = group), 
+               fill = NA, color = "black", linewidth = 0.5) + 
+  # Plot the grid squares (optional)
+  geom_sf(data = grid, fill = NA, color = "lightgrey") + 
+  # Plot the earthquake points
+  geom_sf(data = events_binned|> 
+         dplyr::arrange(MAG), aes(color = MAG, alpha = MAG)) +
+  coord_sf(xlim = range(-121.1,-113.9), 
+           ylim = range(31.9,37.2)) + 
+  # Use a color scale that highlights intensity
+  scale_color_viridis_c(option = "magma") +
+  theme_minimal() +
+  labs(title = "Earthquake Events Map",
+       subtitle = "Colored by magnitude",
+       color = "Magnitude",
+       size = "Magnitude")
+
+```
+
+
+#### Y
+```{r}
+library(dplyr)
+library(tidyr)
+library(Matrix) # Stores indices with data only.
+
+# Filter by threshold and extract the date (ignoring time)
+events_filtered <- events_binned %>%
+  filter(MAG >= threshold) %>%
+  mutate(date = as.Date(date_time)) %>%
+  st_drop_geometry() # Remove spatial data to speed up processing
+
+# Create a sequence of all days in catalog range
+all_days <- seq(min(as.Date(catalog$date_time)), max(as.Date(catalog$date_time)), by="day")
+
+# Use table() to count events per day per grid_id
+# We factorize grid_id and date to ensure every cell/day is represented
+event_counts <- table(
+  factor(events_filtered$date, levels = as.character(all_days)),
+  factor(events_filtered$grid_id, levels = 1:nrow(grid))
+)
+
+# Convert to a matrix (1 if event with 4.5 >= MAG occurred, 0 otherwise)
+Y <- (event_counts > 0)*1
+#Gets rid of dimension names. Col.Names: grid id; Row Names: Date
+dimnames(Y) <- NULL
+
+```
+
+
+### X1
+
+```{r}
+# Ensure we are working with a projected CRS (meters) for accurate 1km checks
+# CRS(meters)EPSG:32611 is for SoCal
+events_binned <- st_transform(events_binned, 32611)
+threshold_events <- events_binned %>% filter(MAG >= threshold)
+
+# Count prior events within 1km and 6 hours
+counts <- sapply(1:nrow(threshold_events), function(i) {
+  target <- threshold_events[i, ]
+  
+  # Time Filter: Find ALL events (any MAG) within 6 hours PRIOR to this target
+  time_diffs <- difftime(target$date_time, events_binned$date_time, units = "hours")
+  potential_indices <- which(time_diffs > 0 & time_diffs <= 6)
+  
+  if (length(potential_indices) == 0) return(0)
+  
+  # Distance Filter: Check those time-valid events for the 1km (1000m) constraint
+  # This only calculates distance for the small subset of time-valid events
+  dists <-  as.numeric(st_distance(target, events_binned[potential_indices, ]))
+  sum(dists <= 1000)
+})
+
+# Map counts back to your filtered data frame
+events_filtered$prior_count <- counts
+
+#Create the final Matrix (X)
+# We use xtabs to sum the 'prior_count' values into the Date x Grid_ID structure
+event_matrix_counts <- xtabs(
+  prior_count ~ factor(date, levels = as.character(all_days)) + 
+                factor(grid_id, levels = 1:nrow(grid)), 
+  data = events_filtered
+)
+
+X <- as.matrix(event_matrix_counts)
+dimnames(X) <- NULL
+```
+
+
+##### ST- DBSCAN
+```{r}
+library(stdbscan)
+library(ggplot2)
+library(dplyr)
+library(sf)
+library(maps)
+
+# Get California counties and filter for Southern California
+ca_counties <- st_as_sf(map("county", "california", plot = FALSE, fill = TRUE))
+
+
+# Prepare your numeric inputs
+# x, y are spatial coords; t is numeric time (e.g., days or hours since start)
+coords <- st_coordinates(events_binned)
+time_numeric <- as.numeric(difftime(events_binned$date_time, min(events_binned$date_time), units = "hours"))
+data = cbind(x = coords[,1], y = coords[,2], t = time_numeric)
+# Run ST-DBSCAN
+# eps_spatial: distance in degrees (0.05 ~ 5.5km)
+# eps_temporal: distance in hours (e.g., 24 hours)
+# min_pts: minimum events to form a cluster
+st_clusters <- st_dbscan(data,
+  eps_spatial = 0.1, 
+  eps_temporal = 6, 
+  min_pts = 5
+)
+
+# Add cluster IDs back to your data
+events_binned$st_cluster <- as.factor(st_clusters$cluster)
+
+```
+
+```{r}
+ggplot(events_binned %>% filter(st_cluster != -1 & st_cluster != 0)) + # Remove noise
+  geom_sf(data = ca_counties, fill = "gray95", color = "gray80") + 
+  geom_sf(aes(color = st_cluster), alpha = 0.6) +
+  coord_sf(xlim = c(-121.1, -113.9), ylim = c(31.9, 37.1), crs = 4326) +
+  theme_minimal() +
+  labs(title = "Spatio-Temporal Earthquake Clusters ")+
+  theme(legend.position = "none") # Remove all legends
+```
+
+
+```{r}
+table(clean_data_filtered$st_cluster)
+```
+
+### Dunn index and DB index
+```{r}
+library(dplyr)
+library(clValid)
+library(clusterSim)
+# Filter out clusters that have fewer than 5 points and noise
+clean_data_filtered <- events_binned %>%
+  filter(st_cluster != 0 & st_cluster != -1) %>%
+  group_by(st_cluster) %>%
+  filter(n() >= 3) %>% 
+  ungroup()
+
+# Check if we still have at least 2 clusters left to compare
+if(length(unique(clean_data_filtered$st_cluster)) > 1) {
+  
+  numeric_data <- sf::st_coordinates(clean_data_filtered)
+  cluster_ids  <- as.numeric(as.character(clean_data_filtered$st_cluster))
+  dist_matrix  <- dist(numeric_data)
+
+  # Run Dunn
+  dunn_val <- dunn(dist_matrix, cluster_ids)
+  print(paste("Dunn Index:", dunn_val))
+
+  # Run Davies-Bouldin
+  db_result <- index.DB(numeric_data, cluster_ids)
+  print(paste("Davies-Bouldin Index:", db_result$DB))
+  
+} else {
+  print("Not enough multi-point clusters to calculate indices.")
+}
+```
+
+
+### Silhouette value 
+```{r}
+library(cluster)
+scaled_matrix <- scale(cbind(coords[,1], coords[,2], time_numeric))
+# Filter out noise points before calculating silhouette
+# Silhouette is not defined for noise in density-based clustering
+is_not_noise <- events_binned$st_cluster != "0"
+clustered_data <- scaled_matrix[is_not_noise, ]
+cluster_ids <- as.numeric(as.character(events_binned$st_cluster[is_not_noise]))
+
+#  Calculate Silhouette
+# Note: For millions of rows, dist() may fail due to memory limits.
+# Use a subset of your data if needed.
+dists <- dist(clustered_data)
+sil <- silhouette(cluster_ids, dists)
+
+```
+
+
+```{r}
+# Extract the summary statistics
+sil_summary <- summary(sil)
+avg_widths <- sil_summary$clus.avg.widths
+
+barplot(sort(avg_widths, decreasing = TRUE), 
+        main = "Average Silhouette Width per Cluster",
+        xlab = "Cluster Index", ylab = "Average Width",
+        col = "steelblue", border = "white")
+abline(h = 0.5, col = "red", lty = 2) # Threshold for "good" clustering
+
+```
+
+
+### PCA
+```{r}
+# load the fast PCA package
+library(irlba)
+
+# Perform Fast PCA
+# We target the top 20 components (nv = 20) instead of all possible p components.
+# Center = TRUE is crucial to look at variance from the mean.
+pca_fast <- irlba(X, nv = 20, center = colMeans(X))
+
+# Analyze the Results
+# 'd' contains the singular values. We square them to get eigenvalues/variance.
+variance_explained <- pca_fast$d^2 / (nrow(X) - 1)
+percent_variance <- variance_explained / sum(apply(X, 2, var)) * 100
+
+# Create the Scree Plot
+# This helps you see how many components are actually useful.
+plot(percent_variance, type = "b", 
+     main = "Scree Plot: Variance Explained by PCs",
+     xlab = "Principal Component", ylab = "Variance (%)")
+
+# Transform Data 
+# Multiply your original matrix X by the rotation matrix (v) to get PC scores.
+X_reduced <- X %*% pca_fast$v
+```
+
+
+```{r}
+library(sf)
+library(maps)
+library(ggplot2)
+
+# 1. Get the California map and ensure it matches your grid's CRS
+ca_map <- st_as_sf(map("county", "california", plot = FALSE, fill = TRUE))
+ca_map <- st_transform(ca_map, st_crs(grid)) # Align CRS (likely 4326)
+
+# 2. Plot the PCA Map
+ggplot() +
+  # Layer 1: The Background Map
+  geom_sf(data = ca_map, fill = "gray80", color = "gray25") +
+  
+  # Layer 2: The PCA Loadings Grid
+  # grid_map is your sf grid object joined with the loadings from the previous step
+  geom_sf(
+  data = events_binned[events_binned$MAG >= threshold, ] |> 
+         dplyr::arrange(MAG), # This puts high MAG at the bottom of the data/top of the plot
+  aes(color = MAG)
+) +
+  scale_color_viridis_c(option = "magma") +
+  geom_sf(data = grid_map, aes(fill = PC1), color = NA, alpha = 0.8) +
+  # Layer 3: Visual Styling
+  scale_fill_gradient2(
+    low = "#0571b0",  # Dark Blue (Negative Loading)
+    mid = "white",     # Neutral
+    high = "#ca0020", # Dark Red (Positive Loading)
+    midpoint = 0
+  ) +
+  
+  # Zoom to Southern California bounding box
+  coord_sf(xlim = c(-121.1, -113.9), ylim = c(31.9, 37.1), expand = FALSE) +
+  
+  theme_minimal() +
+  labs(
+    title = "Principal Component 1",
+    fill = "PC Weight"
+  )
+```
+
+
+```{r}
+ggplot() +
+  # Layer 1: The Background Map
+  geom_sf(data = ca_map, fill = "gray80", color = "gray25") +
+  
+  # Layer 2: The PCA Loadings Grid
+  # grid_map is your sf grid object joined with the loadings from the previous step
+  geom_sf(data = events_binned[events_binned$MAG>=threshold,]|> 
+         dplyr::arrange(MAG), aes(color = MAG)) +
+  scale_color_viridis_c(option = "magma") +
+  geom_sf(data = grid_map, aes(fill = PC2), color = NA, alpha = 0.8) +
+  # Layer 3: Visual Styling
+  scale_fill_gradient2(
+    low = "#0571b0",  # Dark Blue (Negative Loading)
+    mid = "white",     # Neutral
+    high = "#ca0020", # Dark Red (Positive Loading)
+    midpoint = 0
+  ) +
+  
+  # Zoom to your specific Southern California bounding box
+  coord_sf(xlim = c(-121.1, -113.9), ylim = c(31.9, 37.1), expand = FALSE) +
+  
+  theme_minimal() +
+  labs(
+    title = "Principal Component 2",
+    fill = "PC Weight"
+  )
+```
+
+
+#### LightGBM
+
+```{r}
+library(lightgbm)
+library(data.table)
+library(dplyr)
+
+# Reshape Matrices to Long Format (Flattening)
+# We convert the Date x Grid matrices into a single table where each row is a (Date, Grid) pair.
+# This results in (n * p) rows.
+data_long <- data.table(
+  y = as.vector(Y), 
+  prior_count = as.vector(X)
+)
+
+# n = rows (days), p = cols (grid cells)
+n <- nrow(Y)
+p <- ncol(Y)
+
+data_long[, grid_id := rep(1:p, each = n)]
+data_long[, day_index := rep(1:n, times = p)]
+
+# Create Train/Test Split (Time-based split is best for forecasting)
+# Let's use the first 80% of days for training, last 20% for testing
+split_idx <- floor(n * 0.8)
+train_rowsO <- data_long[day_index <= split_idx]
+test_rowsO <- data_long[day_index > split_idx]
+
+#  Convert to LightGBM Dataset Format
+# This format is memory-efficient and required for the lightgbm function
+dtrain <- lgb.Dataset(
+  data = as.matrix(train_rowsO[, .(prior_count, grid_id)]), 
+  label = train_rowsO$y
+)
+
+#  Set Parameters
+# Since earthquakes are rare (mostly 0s), we use 'is_unbalance = TRUE' 
+# or 'scale_pos_weight' to help the model find the 1s.
+params <- list(
+  objective = "binary",
+  metric = "auc",         # Area Under Curve is better for rare events than Accuracy
+  learning_rate = 0.05,
+  num_leaves = 31,        # Main complexity control
+  is_unbalance = TRUE,    # Crucial for seismic data where Y=1 is rare
+  boost_from_average = TRUE
+)
+
+# Train the Model
+modelO <- lgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 100,          # Number of boosting iterations
+  valids = list(test = lgb.Dataset(
+    data = as.matrix(test_rowsO[, .(prior_count, grid_id)]), 
+    label = test_rowsO$y
+  )),
+  early_stopping_rounds = 10
+)
+
+# Predict and Evaluate
+predsO <- predict(modelO, as.matrix(test_rowsO[, .(prior_count, grid_id)]))
+# Resulting 'preds' is a probability between 0 and 1
+
+```
+
+```{r}
+library(lightgbm)
+library(pROC)
+library(data.table)
+
+X_pca <- X_reduced[, 1:2]
+
+# Create the long-format data table
+# y is your flattened Y matrix (n * p)
+model_data_pca <- data.table(
+  y = as.vector(Y),
+  PC1 = rep(X_pca[, 1], each = nrow(Y) / nrow(X_pca)), # Ensure alignment
+  PC2 = rep(X_pca[, 2], each = nrow(Y) / nrow(X_pca))
+)
+
+# Split into Train (80%) and Test (20%)
+train_idx <- sample(1:nrow(model_data_pca), 0.8 * nrow(model_data_pca))
+train_data_pca <- model_data_pca[train_idx, ]
+test_data_pca <- model_data_pca[-train_idx, ]
+
+# Create LightGBM datasets
+dtrain <- lgb.Dataset(data = as.matrix(train_data_pca[, .(PC1, PC2)]), label = train_data_pca$y)
+
+# Set parameters for binary classification
+params <- list(
+  objective = "binary",
+  metric = "auc",
+  is_unbalance = TRUE, # Handling the rare earthquake events
+  learning_rate = 0.1
+)
+
+# Train
+model_pca <- lgb.train(params = params, data = dtrain, nrounds = 100)
+
+preds_pca <- predict(model_pca, as.matrix(test_data_pca[, .(PC1, PC2)]))
+```
+
+
+```{r}
+library(PRROC)
+library(data.table)
+# Calculate PR Curves
+pr_pca  <- pr.curve(scores.class0 = preds_pca, weights.class0 = test_data_pca$y, curve = TRUE)
+pr_orig <- pr.curve(scores.class0 = predsO, weights.class0 = test_rowsO$y, curve = TRUE)
+
+# Plot Comparison
+plot(pr_pca, color = "#228be6", auc.main = FALSE, main = "Precision-Recall Comparison")
+plot(pr_orig, add = TRUE, color = "#fa5252")
+
+legend("right", 
+       legend = c(paste("PCA Model (AUC:", round(pr_pca$auc.integral, 3), ")"),
+                paste("Original Model (AUC:", round(pr_orig$auc.integral, 3), ")")),
+       col = c("#228be6", "#fa5252"), lty = 1, lwd = 2)
+```
+
+
+```{r}
+library(pROC)
+
+roc_pca  <- roc(test_data_pca$y, preds_pca)
+roc_orig <- roc(test_rowsO$y, predsO)
+
+plot(roc_pca, col = "#228be6", lwd = 3, main = "ROC Curve Comparison")
+lines(roc_orig, col = "#fa5252", lwd = 3)
+
+legend("bottomright", 
+       legend = c(paste("PCA (AUC:", round(auc(roc_pca), 3), ")"),
+                paste("Original (AUC:", round(auc(roc_orig), 3), ")")),
+       col = c("#228be6", "#fa5252"), lty = 1, lwd = 3)
+```
+
+```{r}
+# X1 prediction
+# High-Precision Threshold (only predict 1 if confidence is > 80%)
+y_pred_high_precisionO <- ifelse(predsO > 0.80, 1, 0)
+
+library(MLmetrics)
+
+# Calculate Precision
+precision_scoreO <- Precision(y_true = test_rowsO$y, y_pred = y_pred_high_precisionO)
+
+# View the Confusion Matrix to see the "False Alarms" (Top Right cell)
+table(Predicted = y_pred_high_precisionO, Actual = test_rowsO$y)
+
+#X_reduced/PC prediction
+y_pred_high_precision_pca <- ifelse(preds_pca > 0.80, 1, 0)
+# Calculate Precision
+precision_score_pca <- Precision(y_true = test_data_pca$y, y_pred = y_pred_high_precision_pca)
+precision_score_pca
+# View the Confusion Matrix to see the "False Alarms" (Top Right cell)
+table(Predicted = y_pred_high_precision_pca, Actual = test_data_pca$y)
+```
